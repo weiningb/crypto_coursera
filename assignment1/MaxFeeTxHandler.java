@@ -1,6 +1,8 @@
 import java.util.HashSet;
 import java.util.ArrayList;
 import java.util.HashMap;
+import java.nio.ByteBuffer;
+import java.util.LinkedList;
 
 public class MaxFeeTxHandler {
 
@@ -11,7 +13,6 @@ public class MaxFeeTxHandler {
     private Transaction[] maxFeeTxs;
     // currTxs during the helper function
     private ArrayList<Transaction> currTxs;
-    private HashSet<Integer> checkedTxIds;
 
     /**
      * Creates a public ledger whose current UTXOPool (collection of unspent transaction outputs) is
@@ -24,7 +25,6 @@ public class MaxFeeTxHandler {
         maxFee = 0;
         maxFeeTxs = new Transaction[0];
         currTxs = new ArrayList<Transaction>();
-        checkedTxIds = new HashSet<Integer>();
     }
 
     /**
@@ -73,10 +73,10 @@ public class MaxFeeTxHandler {
     /**
      * Helper function to recursively calculate the max fee
      */
-    private void handleTxsHelper(Transaction[] possibleTxs, double currFee) {
+    private void handleTxsHelper(Transaction[] possibleTxs, int currId, double currFee) {
         int possibleTxsNum = possibleTxs.length;
         // all Txs are through, decide if the fee is max
-        if (checkedTxIds.size() == possibleTxsNum) {
+        if (currId == possibleTxsNum) {
             if (currFee > maxFee) {
                 maxFee = currFee;
                 maxFeeTxs = currTxs.toArray(new Transaction[currTxs.size()]);
@@ -84,64 +84,99 @@ public class MaxFeeTxHandler {
             return;
         }
 
-        for (int i = 0; i < possibleTxsNum; i++) {
-            if (!checkedTxIds.contains(i)) {
-                checkedTxIds.add(i);
-                Transaction currTrans = possibleTxs[i];
+        for (int i = currId; i < possibleTxsNum; i++) {
+            Transaction currTrans = possibleTxs[i];
+
+            // temperal hashmap to store input to original output
+            // do this only if current Tx is valid
+            if (isValidTx(currTrans)) {
+
+                currTxs.add(currTrans);
                 double originalSum = 0;
-                double outputSum = 0;
-                // temperal hashmap to store input to original output
                 HashMap<UTXO, Transaction.Output> inputTmp = new HashMap<UTXO, Transaction.Output>();
-                // do this only if current Tx is valid
-                if (isValidTx(currTrans)) {
+                // remove all original outputs
+                for (Transaction.Input in : currTrans.getInputs()) {
+                    UTXO currOriginalOutput = new UTXO(in.prevTxHash, in.outputIndex);
+                    Transaction.Output originalOut = uPool.getTxOutput(currOriginalOutput);
+                    originalSum += originalOut.value;
+                    inputTmp.put(currOriginalOutput, uPool.getTxOutput(currOriginalOutput));
+                    uPool.removeUTXO(currOriginalOutput);
+                }
 
-                    currTxs.add(currTrans);
-
-                    // remove all original outputs
-                    for (Transaction.Input in : currTrans.getInputs()) {
-                        UTXO currOriginalOutput = new UTXO(in.prevTxHash, in.outputIndex);
-                        Transaction.Output originalOut = uPool.getTxOutput(currOriginalOutput);
-                        originalSum += originalOut.value;
-                        inputTmp.put(currOriginalOutput, uPool.getTxOutput(currOriginalOutput));
-                        uPool.removeUTXO(currOriginalOutput);
-                    }
-
-                    // add new outputs
-                    int currOutputNum = currTrans.getOutputs().size();
-                    for (int j = 0; j < currOutputNum; j++) {
-                        Transaction.Output currOut = currTrans.getOutput(j);
-                        outputSum += currOut.value;
-                        UTXO currOutput = new UTXO(currTrans.getHash(), j);
-                        uPool.addUTXO(currOutput, currOut);
-                    }
+                double outputSum = 0;
+                // add new outputs
+                int currOutputNum = currTrans.getOutputs().size();
+                for (int j = 0; j < currOutputNum; j++) {
+                    Transaction.Output currOut = currTrans.getOutput(j);
+                    outputSum += currOut.value;
+                    UTXO currOutput = new UTXO(currTrans.getHash(), j);
+                    uPool.addUTXO(currOutput, currOut);
                 }
 
                 // update the fee and call next level
                 double newFee = currFee + originalSum - outputSum;
-                handleTxsHelper(possibleTxs, newFee);
+                handleTxsHelper(possibleTxs, i+1, newFee);
 
-                if (isValidTx(currTrans)) {
-                    // revert all the changes caused by current Tx
-                    // add all the original outputs back
-                    for (Transaction.Input in : currTrans.getInputs()) {
-                        UTXO currOriginalOutput = new UTXO(in.prevTxHash, in.outputIndex);
-                        uPool.addUTXO(currOriginalOutput, inputTmp.get(currOriginalOutput));
-                    }
-
-                    // remove all the new outputs
-                    int currOutputNum = currTrans.getOutputs().size();
-                    for (int j = 0; j < currOutputNum; j++) {
-                        UTXO currOutput = new UTXO(currTrans.getHash(), j);
-                        uPool.removeUTXO(currOutput);
-                    }
-
-                    // remove current Tx
-                    currTxs.remove(currTxs.size()-1);
+                // revert all the changes caused by current Tx
+                // add all the original outputs back
+                for (Transaction.Input in : currTrans.getInputs()) {
+                    UTXO currOriginalOutput = new UTXO(in.prevTxHash, in.outputIndex);
+                    uPool.addUTXO(currOriginalOutput, inputTmp.get(currOriginalOutput));
                 }
 
-                checkedTxIds.remove(i); 
+                // remove all the new outputs
+                for (int j = 0; j < currOutputNum; j++) {
+                    UTXO currOutput = new UTXO(currTrans.getHash(), j);
+                    uPool.removeUTXO(currOutput);
+                }
+
+                // remove current Tx
+                currTxs.remove(currTxs.size()-1);
             }
         }
+    }
+
+    /**
+     * Sort the txs according to dependency, tx w/o dependencies will come first
+     */
+
+    private Transaction[] topoSort(Transaction[] txs) {
+        ArrayList<Transaction> sorted = new ArrayList<Transaction>();
+        HashSet<ByteBuffer> allHashes = new HashSet<ByteBuffer>();
+        HashSet<Transaction> allTrans = new HashSet<Transaction>();
+        int txsNum = txs.length;
+        for (int i = 0; i < txsNum; i++) {
+            allHashes.add(ByteBuffer.wrap(txs[i].getHash()));
+            allTrans.add(txs[i]);
+        }
+        LinkedList<Transaction> txsWithoutDepend = new LinkedList<Transaction>();
+        for (int i = 0; i < txsNum; i++) {
+            Transaction currTrans = txs[i];
+            boolean hasDepend = false;
+            for (Transaction.Input in : currTrans.getInputs()) {
+                hasDepend = (hasDepend || allHashes.contains(ByteBuffer.wrap(in.prevTxHash)));
+            }
+            if (!hasDepend) {
+                txsWithoutDepend.add(currTrans);
+                allTrans.remove(currTrans);
+            }
+        }
+        while (txsWithoutDepend.size() > 0) {
+            Transaction currHead = txsWithoutDepend.getFirst();
+            allHashes.remove(ByteBuffer.wrap(currHead.getHash()));
+            for (Transaction currTrans : allTrans) {
+                boolean hasDepend = false;
+                for (Transaction.Input in : currTrans.getInputs()) {
+                    hasDepend = (hasDepend || allHashes.contains(ByteBuffer.wrap(in.prevTxHash)));
+                }
+                if (!hasDepend) {
+                    txsWithoutDepend.add(currTrans);
+                    allTrans.remove(currTrans);
+                }
+            }
+            sorted.add(currHead);
+        }
+        return sorted.toArray(new Transaction[sorted.size()]);
     }
 
     /**
@@ -154,9 +189,11 @@ public class MaxFeeTxHandler {
         maxFee = 0;
         maxFeeTxs = new Transaction[0];
         currTxs = new ArrayList<Transaction>();
-        checkedTxIds = new HashSet<Integer>();
 
-        handleTxsHelper(possibleTxs, 0);
+        // topo sort so that no dependency tx always comes first
+        //Transaction[] sortedTxs = topoSort(possibleTxs);
+
+        handleTxsHelper(possibleTxs, 0, 0);
 
         // update uPool according to the maxFeeTxs
         int maxFeeTxsNum = maxFeeTxs.length;
